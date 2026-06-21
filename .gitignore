@@ -1,0 +1,15 @@
+# Secrets — never commit
+.weekend-mode/config.json
+.weekend-mode/state.json
+.weekend-mode/usage_snapshot.json
+.weekend-mode/handoff.md
+.weekend-mode/stop.flag
+.weekend-mode/skip.flag
+.weekend-mode/session.log
+.weekend-mode/announcement.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv*/

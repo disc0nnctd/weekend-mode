@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekend autonomous mode — run one scheduled task
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/notdc/scripts/weekend_scheduler.py
+WorkingDirectory=/home/notdc
+Environment=HOME=/home/notdc
+Environment=PATH=/home/notdc/.local/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=append:/home/notdc/.weekend-mode/session.log
+StandardError=append:/home/notdc/.weekend-mode/session.log

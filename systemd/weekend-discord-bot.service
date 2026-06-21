@@ -1,0 +1,19 @@
+[Unit]
+Description=Weekend mode Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/notdc/.venv-weekend/bin/python3 /home/notdc/scripts/weekend_discord_bot.py
+WorkingDirectory=/home/notdc
+Environment=HOME=/home/notdc
+Environment=PATH=/home/notdc/.venv-weekend/bin:/home/notdc/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

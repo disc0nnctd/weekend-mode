@@ -1,0 +1,8 @@
+{
+  "_note": "Copy to ~/.weekend-mode/config.json and fill in real values",
+  "DISCORD_BOT_TOKEN": "YOUR_DISCORD_BOT_TOKEN",
+  "DISCORD_GUILD_ID": "YOUR_GUILD_ID",
+  "CODEX_LB_KEY": "codex-lb-local",
+  "CODEX_LB_API_KEY": "sk-clb-YOUR_KEY_HERE",
+  "_codex_note": "Get API key from http://127.0.0.1:2455 dashboard (Settings → API Keys)"
+}

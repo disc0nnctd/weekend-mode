@@ -1,0 +1,27 @@
+{
+  "active": false,
+  "weekly_deadline_utc": null,
+  "settings": {
+    "claude_5h_threshold_pct": 90,
+    "claude_7d_threshold_pct": 95,
+    "codex_guard_pct": 50,
+    "max_task_budget_min": 120,
+    "deadline_override_utc": null,
+    "project_queue": [
+      "hermes-trading",
+      "unified-expense-os",
+      "tokeneyes"
+    ]
+  },
+  "project_dirs": {
+    "hermes-trading": "/home/notdc/trader",
+    "unified-expense-os": "/home/notdc/projects/unified-expense-os",
+    "tokeneyes": "/home/notdc/projects/tokeneyes"
+  },
+  "current_project_index": 0,
+  "sessions_run": 0,
+  "tasks_completed": [],
+  "last_issue_worked": null,
+  "last_session_end_utc": null,
+  "announcement_channel_id": 1509496080239296593
+}

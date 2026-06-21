@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
@@ -41,11 +42,55 @@ USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 USAGE_SNAPSHOT = WEEKEND_DIR / "usage_snapshot.json"
 ANNOUNCEMENT_LOG = WEEKEND_DIR / "last_announcement.json"
 CODEX_LB_URL = "http://127.0.0.1:2455"
+ENGINES = ("claude", "codex", "gemini")
+MODEL_LANES = ("default", "orchestration", "worker", "research")
+DEFAULT_MODELS = {
+    "claude": "sonnet",
+    "codex": "gpt-5.4",
+    "gemini": "gemini-2.5-pro",
+}
+DEFAULT_LANE_MODELS = {
+    "orchestration": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-pro"},
+    "worker": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-flash"},
+    "research": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-pro"},
+}
+SMOKE_TEST_MODELS = {
+    "claude": "fable",
+    "codex": "gpt-5.3-codex-spark",
+    "gemini": "gemini-2.5-flash",
+}
+SMOKE_TEST_PROMPT = "Reply with exactly: ok"
+DEFAULT_ENGINE_TOGGLES = {
+    "claude": True,
+    "codex": True,
+    "gemini": False,
+}
+DEFAULT_WORKER_TOGGLES = {
+    "claude": True,
+    "codex": True,
+    "gemini": True,
+}
+DEFAULT_SETTINGS = {
+    "claude_5h_threshold_pct": 90,
+    "claude_7d_threshold_pct": 95,
+    "codex_guard_pct": 50,
+    "max_task_budget_min": 120,
+    "deadline_override_utc": None,
+    "project_queue": [
+        "hermes-trading",
+        "unified-expense-os",
+        "tokeneyes",
+    ],
+    "default_models": DEFAULT_MODELS,
+    "lane_models": DEFAULT_LANE_MODELS,
+    "start_allowed_orchestrators": DEFAULT_ENGINE_TOGGLES,
+    "start_allowed_workers": DEFAULT_WORKER_TOGGLES,
+}
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    return json.loads(STATE_FILE.read_text())
+    return normalize_state(json.loads(STATE_FILE.read_text()))
 
 
 def save_state(state: dict):
@@ -54,6 +99,140 @@ def save_state(state: dict):
 
 def load_config() -> dict:
     return json.loads(CONFIG_FILE.read_text())
+
+
+def _deep_fill_missing(target: dict, defaults: dict) -> bool:
+    changed = False
+    for key, value in defaults.items():
+        if key not in target:
+            target[key] = json.loads(json.dumps(value))
+            changed = True
+            continue
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            changed = _deep_fill_missing(target[key], value) or changed
+    return changed
+
+
+def normalize_state(state: dict) -> dict:
+    state.setdefault("settings", {})
+    _deep_fill_missing(state["settings"], DEFAULT_SETTINGS)
+    for lane_name, models in DEFAULT_LANE_MODELS.items():
+        lane_models = state["settings"]["lane_models"].setdefault(lane_name, {})
+        _deep_fill_missing(lane_models, models)
+    _deep_fill_missing(state["settings"]["default_models"], DEFAULT_MODELS)
+    _deep_fill_missing(state["settings"]["start_allowed_orchestrators"], DEFAULT_ENGINE_TOGGLES)
+    _deep_fill_missing(state["settings"]["start_allowed_workers"], DEFAULT_WORKER_TOGGLES)
+    state.setdefault(
+        "session_allowed_orchestrators",
+        json.loads(json.dumps(state["settings"]["start_allowed_orchestrators"])),
+    )
+    state.setdefault(
+        "session_allowed_workers",
+        json.loads(json.dumps(state["settings"]["start_allowed_workers"])),
+    )
+    return state
+
+
+def resolve_lane_model(state: dict, lane: str, engine: str) -> str:
+    settings = state["settings"]
+    if lane == "default":
+        return settings.get("default_models", {}).get(engine, DEFAULT_MODELS[engine])
+    lane_models = settings.get("lane_models", {})
+    model = lane_models.get(lane, {}).get(engine)
+    if model:
+        return model
+    default_models = settings.get("default_models", {})
+    return default_models.get(engine, DEFAULT_MODELS[engine])
+
+
+def enabled_engines(toggle_map: dict) -> list[str]:
+    return [engine for engine in ENGINES if toggle_map.get(engine)]
+
+
+def format_toggle_summary(toggle_map: dict) -> str:
+    active = enabled_engines(toggle_map)
+    return ", ".join(active) if active else "none"
+
+
+def engine_available(engine: str) -> bool:
+    if engine == "claude":
+        return CREDS_PATH.exists() or shutil.which("claude") is not None
+    return shutil.which(engine) is not None
+
+
+def run_provider_smoke_test(engine: str, timeout_sec: int = 45) -> dict:
+    model = SMOKE_TEST_MODELS[engine]
+    if not engine_available(engine):
+        return {"ok": False, "model": model, "detail": "CLI not installed or unavailable"}
+    try:
+        if engine == "claude":
+            cmd = [
+                "timeout", str(timeout_sec),
+                "claude", "--dangerously-skip-permissions",
+                "--model", model,
+                "-p", SMOKE_TEST_PROMPT,
+            ]
+            env = os.environ.copy()
+        elif engine == "codex":
+            cmd = [
+                "timeout", str(timeout_sec),
+                "codex", "exec",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model", model,
+                SMOKE_TEST_PROMPT,
+            ]
+            env = {**os.environ, "CODEX_HOME": "/home/notdc/.codex-cc-connect"}
+        else:
+            cmd = [
+                "timeout", str(timeout_sec),
+                "gemini",
+                "--model", model,
+                "--prompt", SMOKE_TEST_PROMPT,
+                "--yolo",
+                "--skip-trust",
+            ]
+            env = os.environ.copy()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec + 5, env=env)
+        output = (result.stdout + "\n" + result.stderr).strip()
+        ok = result.returncode == 0 and "ok" in output.lower()
+        detail = output.splitlines()[-1][:160] if output else f"exit={result.returncode}"
+        return {"ok": ok, "model": model, "detail": detail}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "model": model, "detail": "timed out"}
+    except Exception as exc:
+        return {"ok": False, "model": model, "detail": str(exc)[:160]}
+
+
+def summarize_test_results(results: dict[str, dict]) -> list[str]:
+    lines = ["**Provider Smoke Tests**"]
+    for engine in ENGINES:
+        result = results.get(engine)
+        if not result:
+            continue
+        status = "PASS" if result["ok"] else "FAIL"
+        lines.append(f"`{engine}` {status} via `{result['model']}` — {result['detail']}")
+    return lines
+
+
+def render_model_settings(state: dict) -> list[str]:
+    settings = state["settings"]
+    lines = [
+        "**Model Controls**",
+        f"Start-time orchestrators: **{format_toggle_summary(state.get('session_allowed_orchestrators', {}))}**",
+        f"Start-time workers: **{format_toggle_summary(state.get('session_allowed_workers', {}))}**",
+        "",
+        "**Defaults**",
+    ]
+    for engine in ENGINES:
+        suffix = "" if engine_available(engine) else " _(CLI missing)_"
+        lines.append(f"`{engine}` → `{resolve_lane_model(state, 'default', engine)}`{suffix}")
+    for lane in ("orchestration", "worker", "research"):
+        lines.append("")
+        lines.append(f"**{lane.title()} Models**")
+        for engine in ENGINES:
+            lines.append(f"`{engine}` → `{resolve_lane_model(state, lane, engine)}`")
+    return lines
 
 
 def usage_bar(pct: float, width: int = 10) -> str:
@@ -367,13 +546,138 @@ tree = app_commands.CommandTree(bot)
 
 # ── Views ──────────────────────────────────────────────────────────────────
 
+def build_weekend_on_message(state: dict, usage: dict | None) -> str:
+    settings = state["settings"]
+    queue = settings["project_queue"]
+    usage_line = ""
+    if usage:
+        usage_line = (f"\nCurrent usage: 5h={usage['5h_pct']:.0f}% "
+                      f"({usage_bar(usage['5h_pct'])})  "
+                      f"7d={usage['7d_pct']:.0f}% ({usage_bar(usage['7d_pct'])})")
+    orchestrators = state.get("session_allowed_orchestrators", {})
+    workers = state.get("session_allowed_workers", {})
+    lines = [
+        "Start weekend autonomous mode?",
+        f"Projects: {' → '.join(queue)}",
+        f"Deadline: Mon 07:30 IST  |  Stop threshold: 5h≥{settings['claude_5h_threshold_pct']}%",
+        f"Orchestrators enabled: {format_toggle_summary(orchestrators)}",
+        f"Workers enabled: {format_toggle_summary(workers)}",
+        "",
+        "**Models**",
+    ]
+    for lane in ("default", "orchestration", "worker", "research"):
+        parts = [f"{engine}={resolve_lane_model(state, lane, engine)}" for engine in ENGINES]
+        lines.append(f"{lane}: " + " | ".join(parts))
+    return "\n".join(lines) + usage_line
+
+
+class ToggleEngineButton(discord.ui.Button):
+    def __init__(self, scope: str, engine: str):
+        self.scope = scope
+        self.engine = engine
+        super().__init__(style=discord.ButtonStyle.secondary, row=0 if scope == "orchestrators" else 1)
+        self.refresh({})
+
+    def refresh(self, toggles: dict):
+        enabled = toggles.get(self.engine, False)
+        prefix = "Orch" if self.scope == "orchestrators" else "Work"
+        marker = "ON" if enabled else "OFF"
+        self.label = f"{prefix}: {self.engine} {marker}"
+        self.style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, WeekendOnView):
+            return
+        target_key = "session_allowed_orchestrators" if self.scope == "orchestrators" else "session_allowed_workers"
+        toggles = view.draft_state[target_key]
+        toggles[self.engine] = not toggles.get(self.engine, False)
+        if not enabled_engines(toggles):
+            toggles[self.engine] = True
+            await interaction.response.send_message(
+                f"{self.scope[:-1].title()} list cannot be empty.",
+                ephemeral=True,
+            )
+            return
+        view.test_results = {}
+        view.refresh_buttons()
+        await interaction.response.edit_message(
+            content=build_weekend_on_message(view.draft_state, view.usage),
+            view=view,
+        )
+
+
 class WeekendOnView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, state: dict, usage: dict | None):
         super().__init__(timeout=60)
+        self.draft_state = json.loads(json.dumps(state))
+        self.usage = usage
+        self.test_results: dict[str, dict] = {}
+        for engine in ENGINES:
+            self.add_item(ToggleEngineButton("orchestrators", engine))
+        for engine in ENGINES:
+            self.add_item(ToggleEngineButton("workers", engine))
+        self.refresh_buttons()
+
+    def refresh_buttons(self):
+        for item in self.children:
+            if isinstance(item, ToggleEngineButton):
+                key = "session_allowed_orchestrators" if item.scope == "orchestrators" else "session_allowed_workers"
+                item.refresh(self.draft_state[key])
+
+    def selected_test_engines(self) -> list[str]:
+        selected = set(enabled_engines(self.draft_state["session_allowed_orchestrators"]))
+        selected.update(enabled_engines(self.draft_state["session_allowed_workers"]))
+        return [engine for engine in ENGINES if engine in selected]
+
+    async def run_selected_provider_tests(self) -> dict[str, dict]:
+        results = {}
+        for engine in self.selected_test_engines():
+            results[engine] = await asyncio.to_thread(run_provider_smoke_test, engine)
+        self.test_results = results
+        return results
+
+    def test_failures(self) -> list[str]:
+        failures = []
+        for engine in self.selected_test_engines():
+            result = self.test_results.get(engine)
+            if result and not result["ok"]:
+                failures.append(engine)
+        return failures
 
     @discord.ui.button(label="✅ Confirm Start", style=discord.ButtonStyle.green)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.test_results:
+            await interaction.response.defer()
+            await self.run_selected_provider_tests()
+            failures = self.test_failures()
+            if failures:
+                content = build_weekend_on_message(self.draft_state, self.usage)
+                content += "\n\n" + "\n".join(summarize_test_results(self.test_results))
+                content += f"\n\nDisable or fix failing providers before starting: {', '.join(failures)}"
+                await interaction.edit_original_response(content=content, view=self)
+                return
+        elif self.test_failures():
+            content = build_weekend_on_message(self.draft_state, self.usage)
+            content += "\n\n" + "\n".join(summarize_test_results(self.test_results))
+            content += f"\n\nDisable or fix failing providers before starting: {', '.join(self.test_failures())}"
+            await interaction.response.edit_message(content=content, view=self)
+            return
         state = load_state()
+        state["last_provider_checks"] = json.loads(json.dumps(self.test_results))
+        state["last_provider_check_utc"] = datetime.now(timezone.utc).isoformat()
+        state["settings"]["start_allowed_orchestrators"] = json.loads(
+            json.dumps(self.draft_state["session_allowed_orchestrators"])
+        )
+        state["settings"]["start_allowed_workers"] = json.loads(
+            json.dumps(self.draft_state["session_allowed_workers"])
+        )
+        state["session_allowed_orchestrators"] = json.loads(
+            json.dumps(self.draft_state["session_allowed_orchestrators"])
+        )
+        state["session_allowed_workers"] = json.loads(
+            json.dumps(self.draft_state["session_allowed_workers"])
+        )
         state["active"] = True
         # Set deadline to next Monday 02:00 UTC (= 7:30 AM IST)
         from datetime import timedelta
@@ -395,6 +699,8 @@ class WeekendOnView(discord.ui.View):
             content=f"**Weekend mode activated** ✅\n"
                     f"Deadline: Mon 07:30 IST\n"
                     f"Projects: {' → '.join(queue)}\n"
+                    f"Orchestrators: {format_toggle_summary(state['session_allowed_orchestrators'])}\n"
+                    f"Workers: {format_toggle_summary(state['session_allowed_workers'])}\n"
                     f"Run `/weekend-approve home-xxx ...` to queue issues for automation.",
             view=None
         )
@@ -402,6 +708,14 @@ class WeekendOnView(discord.ui.View):
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Cancelled.", view=None)
+
+    @discord.ui.button(label="🧪 Test Providers", style=discord.ButtonStyle.primary, row=2)
+    async def test_providers(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await self.run_selected_provider_tests()
+        content = build_weekend_on_message(self.draft_state, self.usage)
+        content += "\n\n" + "\n".join(summarize_test_results(self.test_results))
+        await interaction.edit_original_response(content=content, view=self)
 
 
 class WeekendStatusView(discord.ui.View):
@@ -532,26 +846,20 @@ class ConfigView(discord.ui.View):
 async def weekend_on(interaction: discord.Interaction):
     state = load_state()
     settings = state["settings"]
-    queue = settings["project_queue"]
     usage = get_claude_usage()
-    usage_line = ""
-    if usage:
-        usage_line = (f"\nCurrent usage: 5h={usage['5h_pct']:.0f}% "
-                      f"({usage_bar(usage['5h_pct'])})  "
-                      f"7d={usage['7d_pct']:.0f}% ({usage_bar(usage['7d_pct'])})")
 
     if state.get("active"):
         await interaction.response.send_message(
-            f"Weekend mode is already active.{usage_line}", ephemeral=True
+            f"Weekend mode is already active.\n"
+            f"Orchestrators: {format_toggle_summary(state.get('session_allowed_orchestrators', {}))}\n"
+            f"Workers: {format_toggle_summary(state.get('session_allowed_workers', {}))}",
+            ephemeral=True
         )
         return
 
     await interaction.response.send_message(
-        f"Start weekend autonomous mode?\n"
-        f"Projects: {' → '.join(queue)}\n"
-        f"Deadline: Mon 07:30 IST  |  Stop threshold: 5h≥{settings['claude_5h_threshold_pct']}%"
-        f"{usage_line}",
-        view=WeekendOnView(),
+        build_weekend_on_message(state, usage),
+        view=WeekendOnView(state, usage),
         ephemeral=True
     )
 
@@ -597,10 +905,21 @@ async def weekend_status(interaction: discord.Interaction):
         f"Sessions run: {state.get('sessions_run', 0)}",
         f"Tasks completed: {done}",
         f"Last issue: `{last}`",
+        f"Orchestrators: {format_toggle_summary(state.get('session_allowed_orchestrators', {}))}",
+        f"Workers: {format_toggle_summary(state.get('session_allowed_workers', {}))}",
     ]
 
     approved = get_approved_issues()
     lines.append(f"Approved queue: {len(approved)} issues")
+    if state.get("last_provider_check_utc"):
+        lines.append(f"Last provider check: {state['last_provider_check_utc']}")
+        checks = state.get("last_provider_checks", {})
+        for engine in ENGINES:
+            result = checks.get(engine)
+            if result:
+                lines.append(
+                    f"{engine}: {'PASS' if result.get('ok') else 'FAIL'} via {result.get('model')} ({result.get('detail')})"
+                )
 
     await interaction.followup.send("\n".join(lines), view=WeekendStatusView(), ephemeral=True)
 
@@ -681,9 +1000,56 @@ async def weekend_config(interaction: discord.Interaction):
         f"Max task budget: **{s['max_task_budget_min']} min**",
         f"Deadline override: **{s.get('deadline_override_utc') or 'auto (Mon 07:30 IST)'}**",
         f"Project queue: **{queue_str}**",
+        "Use `/weekend-models` and `/weekend-model-set` for model lanes.",
     ]
     await interaction.response.send_message(
         "\n".join(lines), view=ConfigView(state), ephemeral=True
+    )
+
+
+@tree.command(name="weekend-models", description="Show default, orchestration, worker, and research models")
+async def weekend_models(interaction: discord.Interaction):
+    state = load_state()
+    await interaction.response.send_message("\n".join(render_model_settings(state)), ephemeral=True)
+
+
+@tree.command(name="weekend-model-set", description="Set a model for a lane and engine")
+@app_commands.describe(
+    lane="default, orchestration, worker, or research",
+    engine="claude, codex, or gemini",
+    model="Model name. Use 'inherit' to fall back to the engine default for non-default lanes.",
+)
+async def weekend_model_set(interaction: discord.Interaction, lane: str, engine: str, model: str):
+    lane = lane.strip().lower()
+    engine = engine.strip().lower()
+    model = model.strip()
+    if lane not in MODEL_LANES:
+        await interaction.response.send_message(f"Invalid lane `{lane}`.", ephemeral=True)
+        return
+    if engine not in ENGINES:
+        await interaction.response.send_message(f"Invalid engine `{engine}`.", ephemeral=True)
+        return
+    state = load_state()
+    if lane == "default":
+        if model.lower() == "inherit":
+            await interaction.response.send_message("`inherit` is not valid for the default lane.", ephemeral=True)
+            return
+        state["settings"]["default_models"][engine] = model
+    else:
+        if model.lower() == "inherit":
+            state["settings"]["lane_models"].setdefault(lane, {}).pop(engine, None)
+            resolved = resolve_lane_model(state, lane, engine)
+            save_state(state)
+            await interaction.response.send_message(
+                f"Reset `{lane}` `{engine}` to inherit default → `{resolved}`",
+                ephemeral=True,
+            )
+            return
+        state["settings"]["lane_models"].setdefault(lane, {})[engine] = model
+    save_state(state)
+    await interaction.response.send_message(
+        f"Updated `{lane}` `{engine}` → `{resolve_lane_model(state, lane, engine)}`",
+        ephemeral=True,
     )
 
 

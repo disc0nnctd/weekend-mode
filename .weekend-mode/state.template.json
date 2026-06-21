@@ -7,6 +7,38 @@
     "codex_guard_pct": 50,
     "max_task_budget_min": 120,
     "deadline_override_utc": null,
+    "default_models": {
+      "claude": "sonnet",
+      "codex": "gpt-5.4",
+      "gemini": "gemini-2.5-pro"
+    },
+    "lane_models": {
+      "orchestration": {
+        "claude": "sonnet",
+        "codex": "gpt-5.4",
+        "gemini": "gemini-2.5-pro"
+      },
+      "worker": {
+        "claude": "sonnet",
+        "codex": "gpt-5.4",
+        "gemini": "gemini-2.5-flash"
+      },
+      "research": {
+        "claude": "sonnet",
+        "codex": "gpt-5.4",
+        "gemini": "gemini-2.5-pro"
+      }
+    },
+    "start_allowed_orchestrators": {
+      "claude": true,
+      "codex": true,
+      "gemini": false
+    },
+    "start_allowed_workers": {
+      "claude": true,
+      "codex": true,
+      "gemini": true
+    },
     "project_queue": [
       "hermes-trading",
       "unified-expense-os",
@@ -23,5 +55,17 @@
   "tasks_completed": [],
   "last_issue_worked": null,
   "last_session_end_utc": null,
+  "last_provider_check_utc": null,
+  "last_provider_checks": {},
+  "session_allowed_orchestrators": {
+    "claude": true,
+    "codex": true,
+    "gemini": false
+  },
+  "session_allowed_workers": {
+    "claude": true,
+    "codex": true,
+    "gemini": true
+  },
   "announcement_channel_id": 1509496080239296593
 }

@@ -12,6 +12,7 @@ Usage:
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -30,6 +31,43 @@ PID_FILE = WEEKEND_DIR / "session.pid"
 CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 CODEX_LB_URL = "http://127.0.0.1:2455/api/accounts"
+ENGINES = ("claude", "codex", "gemini")
+DEFAULT_MODELS = {
+    "claude": "sonnet",
+    "codex": "gpt-5.4",
+    "gemini": "gemini-2.5-pro",
+}
+DEFAULT_LANE_MODELS = {
+    "orchestration": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-pro"},
+    "worker": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-flash"},
+    "research": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-pro"},
+}
+DEFAULT_ENGINE_TOGGLES = {
+    "claude": True,
+    "codex": True,
+    "gemini": False,
+}
+DEFAULT_WORKER_TOGGLES = {
+    "claude": True,
+    "codex": True,
+    "gemini": True,
+}
+DEFAULT_SETTINGS = {
+    "claude_5h_threshold_pct": 90,
+    "claude_7d_threshold_pct": 95,
+    "codex_guard_pct": 50,
+    "max_task_budget_min": 120,
+    "deadline_override_utc": None,
+    "project_queue": [
+        "hermes-trading",
+        "unified-expense-os",
+        "tokeneyes",
+    ],
+    "default_models": DEFAULT_MODELS,
+    "lane_models": DEFAULT_LANE_MODELS,
+    "start_allowed_orchestrators": DEFAULT_ENGINE_TOGGLES,
+    "start_allowed_workers": DEFAULT_WORKER_TOGGLES,
+}
 
 DRY_RUN = "--dry-run" in sys.argv
 
@@ -46,7 +84,7 @@ def log(msg: str):
 
 
 def load_state() -> dict:
-    return json.loads(STATE_FILE.read_text())
+    return normalize_state(json.loads(STATE_FILE.read_text()))
 
 
 def save_state(state: dict):
@@ -56,6 +94,49 @@ def save_state(state: dict):
 
 def load_config() -> dict:
     return json.loads(CONFIG_FILE.read_text())
+
+
+def _deep_fill_missing(target: dict, defaults: dict) -> None:
+    for key, value in defaults.items():
+        if key not in target:
+            target[key] = json.loads(json.dumps(value))
+            continue
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_fill_missing(target[key], value)
+
+
+def normalize_state(state: dict) -> dict:
+    state.setdefault("settings", {})
+    _deep_fill_missing(state["settings"], DEFAULT_SETTINGS)
+    for lane_name, models in DEFAULT_LANE_MODELS.items():
+        lane_models = state["settings"]["lane_models"].setdefault(lane_name, {})
+        _deep_fill_missing(lane_models, models)
+    _deep_fill_missing(state["settings"]["default_models"], DEFAULT_MODELS)
+    _deep_fill_missing(state["settings"]["start_allowed_orchestrators"], DEFAULT_ENGINE_TOGGLES)
+    _deep_fill_missing(state["settings"]["start_allowed_workers"], DEFAULT_WORKER_TOGGLES)
+    state.setdefault(
+        "session_allowed_orchestrators",
+        json.loads(json.dumps(state["settings"]["start_allowed_orchestrators"])),
+    )
+    state.setdefault(
+        "session_allowed_workers",
+        json.loads(json.dumps(state["settings"]["start_allowed_workers"])),
+    )
+    return state
+
+
+def resolve_lane_model(state: dict, lane: str, engine: str) -> str:
+    settings = state["settings"]
+    if lane == "default":
+        return settings.get("default_models", {}).get(engine, DEFAULT_MODELS[engine])
+    model = settings.get("lane_models", {}).get(lane, {}).get(engine)
+    if model:
+        return model
+    return settings.get("default_models", {}).get(engine, DEFAULT_MODELS[engine])
+
+
+def enabled_engines(toggle_map: dict) -> list[str]:
+    return [engine for engine in ENGINES if toggle_map.get(engine)]
 
 
 def get_claude_usage() -> dict | None:
@@ -96,32 +177,44 @@ def get_codex_health(config: dict) -> dict | None:
             return None
         resp.raise_for_status()
         accounts = resp.json()
+        if isinstance(accounts, dict):
+            accounts = accounts.get("accounts", [])
         if not accounts:
             return None
-        # minimum remaining across all active accounts
-        remaining = min(
-            (a.get("remainingPercent", 100) for a in accounts
-             if a.get("status") not in ("paused", "disabled")),
-            default=100
-        )
+        remaining_candidates = []
+        for account in accounts:
+            if account.get("status") in ("paused", "disabled", "deactivated", "quota_exceeded"):
+                continue
+            usage = account.get("usage") or {}
+            if "secondaryRemainingPercent" in usage:
+                remaining_candidates.append(float(usage["secondaryRemainingPercent"]))
+            elif "remainingPercent" in account:
+                remaining_candidates.append(float(account["remainingPercent"]))
+        remaining = min(remaining_candidates, default=100)
         return {"remaining_pct": remaining}
     except Exception:
         return None
 
 
+def gemini_available() -> bool:
+    return shutil.which("gemini") is not None
+
+
 def pick_engine(usage: dict | None, codex_health: dict | None, state: dict) -> str:
-    """Returns 'claude', 'codex', or 'wait'."""
+    """Returns 'claude', 'codex', 'gemini', or 'wait'."""
     settings = state["settings"]
     threshold_5h = settings["claude_5h_threshold_pct"]
     codex_guard = settings["codex_guard_pct"]
+    allowed = enabled_engines(state.get("session_allowed_orchestrators", {}))
 
-    # Claude available?
-    if usage is not None and usage["5h_pct"] < threshold_5h:
+    if "claude" in allowed and usage is not None and usage["5h_pct"] < threshold_5h:
         return "claude"
 
-    # Codex available with enough headroom?
-    if codex_health is not None and codex_health["remaining_pct"] > codex_guard:
+    if "codex" in allowed and codex_health is not None and codex_health["remaining_pct"] > codex_guard:
         return "codex"
+
+    if "gemini" in allowed and gemini_available():
+        return "gemini"
 
     return "wait"
 
@@ -176,7 +269,14 @@ def compute_budget_min(usage: dict | None, state: dict) -> int:
     return max(15, min(budget, max_budget))
 
 
-def build_prompt(issue: dict, budget_min: int) -> str:
+def build_prompt(issue: dict, budget_min: int, state: dict, engine: str, model: str) -> str:
+    allowed_workers = enabled_engines(state.get("session_allowed_workers", {}))
+    worker_models = ", ".join(
+        f"{worker}={resolve_lane_model(state, 'worker', worker)}" for worker in allowed_workers
+    ) or "none"
+    research_models = ", ".join(
+        f"{worker}={resolve_lane_model(state, 'research', worker)}" for worker in allowed_workers
+    ) or "none"
     return f"""You are running in weekend autonomous mode on the {issue['project']} project.
 
 Task: [{issue['id']}] {issue['title']}
@@ -185,6 +285,11 @@ Description: {issue['description']}
 Working directory: {issue['project_dir']}
 Time budget: {budget_min} minutes. Work without asking for confirmation.
 Current time: {datetime.now(timezone.utc).isoformat()}
+Orchestrator engine: {engine}
+Orchestrator model: {model}
+Allowed worker engines: {", ".join(allowed_workers) or "none"}
+Worker models: {worker_models}
+Research models: {research_models}
 
 Instructions:
 1. Run: bd update {issue['id']} --claim
@@ -210,12 +315,16 @@ def is_session_running() -> bool:
         return False
 
 
-def run_task(issue: dict, engine: str, budget_min: int):
-    prompt = build_prompt(issue, budget_min)
-    log(f"Starting task {issue['id']} ({issue['title'][:60]}) via {engine}, budget={budget_min}min")
+def run_task(issue: dict, engine: str, budget_min: int, state: dict):
+    model = resolve_lane_model(state, "orchestration", engine)
+    prompt = build_prompt(issue, budget_min, state, engine, model)
+    log(
+        f"Starting task {issue['id']} ({issue['title'][:60]}) via {engine}"
+        f" model={model}, budget={budget_min}min"
+    )
 
     if DRY_RUN:
-        log(f"DRY RUN: would run {engine} with {budget_min}min budget on {issue['id']}")
+        log(f"DRY RUN: would run {engine}/{model} with {budget_min}min budget on {issue['id']}")
         return
 
     SKIP_FLAG.unlink(missing_ok=True)
@@ -223,15 +332,29 @@ def run_task(issue: dict, engine: str, budget_min: int):
     if engine == "claude":
         cmd = [
             "timeout", str(budget_min * 60),
-            "claude", "--dangerously-skip-permissions", "-p", prompt
+            "claude", "--dangerously-skip-permissions", "--model", model, "-p", prompt
         ]
         env = os.environ.copy()
+    elif engine == "codex":
+        cmd = [
+            "timeout", str(budget_min * 60),
+            "codex", "exec",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--model", model,
+            prompt,
+        ]
+        env = {**os.environ, "CODEX_HOME": "/home/notdc/.codex-cc-connect"}
     else:
         cmd = [
             "timeout", str(budget_min * 60),
-            "codex", "--full-auto", "-q", prompt
+            "gemini",
+            "--model", model,
+            "--prompt", prompt,
+            "--yolo",
+            "--skip-trust",
         ]
-        env = {**os.environ, "CODEX_HOME": "/home/notdc/.codex-cc-connect"}
+        env = os.environ.copy()
 
     proc = subprocess.Popen(
         cmd, env=env, stdout=open(SESSION_LOG, "a"), stderr=subprocess.STDOUT
@@ -304,6 +427,8 @@ def main():
         log(f"Claude usage: 5h={usage['5h_pct']:.0f}% (resets {usage['5h_resets_at']}), 7d={usage['7d_pct']:.0f}%")
     if codex_health:
         log(f"Codex pool: {codex_health['remaining_pct']:.0f}% remaining")
+    if gemini_available():
+        log("Gemini CLI available")
 
     # Check 7d hard stop
     if usage and usage["7d_pct"] >= state["settings"]["claude_7d_threshold_pct"]:
@@ -316,7 +441,7 @@ def main():
 
     if engine == "wait":
         resets_at = usage["5h_resets_at"] if usage else "unknown"
-        log(f"All engines at limit. Window resets at {resets_at}. Will retry next timer tick.")
+        log(f"No enabled orchestrator is currently usable. Claude resets at {resets_at}. Will retry next timer tick.")
         return
 
     issue = get_next_approved_issue(state)
@@ -334,7 +459,7 @@ def main():
     state["sessions_run"] = state.get("sessions_run", 0) + 1
     save_state(state)
 
-    returncode = run_task(issue, engine, budget)
+    returncode = run_task(issue, engine, budget, state)
 
     # Mark issue completed in state if claude exited cleanly
     if returncode in (0, None):

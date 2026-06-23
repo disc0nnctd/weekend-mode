@@ -90,6 +90,7 @@ DEFAULT_SETTINGS = {
     "opencode_go_alert_pct": 100,
     "opencode_guard_pct_5h": 50,
     "opencode_guard_pct_month": 50,
+    "opencode_guard_relax_hours": 2,
     "system_temp_warn_c": {
         "cpu_package": 85,
         "nvme": 70,

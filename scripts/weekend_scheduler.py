@@ -70,6 +70,7 @@ DEFAULT_SETTINGS = {
     "opencode_go_alert_pct": 100,
     "opencode_guard_pct_5h": 50,
     "opencode_guard_pct_month": 50,
+    "opencode_guard_relax_hours": 2,
     "max_task_budget_min": 120,
     "deadline_override_utc": None,
     "project_queue": [
@@ -248,6 +249,23 @@ def gemini_available() -> bool:
     return shutil.which("gemini") is not None
 
 
+_OPENCODE_RELAX_PCT = 98
+
+
+def _effective_opencode_guard(guard_pct: float, reset_at_iso: str | None, relax_hours: float) -> float:
+    """Return relaxed guard (98%) if reset is within relax_hours, else configured guard."""
+    if not reset_at_iso:
+        return guard_pct
+    try:
+        reset_at = datetime.fromisoformat(reset_at_iso)
+        hours_left = (reset_at - datetime.now(timezone.utc)).total_seconds() / 3600
+        if 0 < hours_left <= relax_hours:
+            return _OPENCODE_RELAX_PCT
+    except Exception:
+        pass
+    return guard_pct
+
+
 def opencode_usable(opencode_summary: dict | None, settings: dict) -> bool:
     if shutil.which("opencode") is None:
         return False
@@ -255,13 +273,16 @@ def opencode_usable(opencode_summary: dict | None, settings: dict) -> bool:
         return True
     guard_5h = settings.get("opencode_guard_pct_5h", 50)
     guard_month = settings.get("opencode_guard_pct_month", 50)
+    relax_hours = settings.get("opencode_guard_relax_hours", 2)
     five_h = opencode_summary["windows"]["5h"]
     month = opencode_summary["windows"]["month"]
-    if float(five_h["pct_used"]) >= guard_5h:
-        log(f"OpenCode guard: 5h spend {five_h['pct_used']:.0f}% >= {guard_5h}% limit. Skipping.")
+    eff_5h = _effective_opencode_guard(guard_5h, five_h.get("reset_at"), relax_hours)
+    eff_month = _effective_opencode_guard(guard_month, month.get("reset_at"), relax_hours)
+    if float(five_h["pct_used"]) >= eff_5h:
+        log(f"OpenCode guard: 5h spend {five_h['pct_used']:.0f}% >= {eff_5h:.0f}% limit. Skipping.")
         return False
-    if float(month["pct_used"]) >= guard_month:
-        log(f"OpenCode guard: monthly spend {month['pct_used']:.0f}% >= {guard_month}% limit. Skipping.")
+    if float(month["pct_used"]) >= eff_month:
+        log(f"OpenCode guard: monthly spend {month['pct_used']:.0f}% >= {eff_month:.0f}% limit. Skipping.")
         return False
     return True
 

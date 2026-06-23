@@ -541,6 +541,9 @@ def run_task(issue: dict, engine: str, budget_min: int, state: dict, config: dic
             prompt,
         ]
         env = os.environ.copy()
+        # opencode snapshots cwd via git-add; must be scoped to project dir,
+        # never /home/notdc (causes multi-minute hang over entire home tree).
+        opencode_cwd = issue.get("project_dir") or str(Path.home())
     else:
         cmd = [
             "timeout", str(budget_min * 60),
@@ -553,9 +556,10 @@ def run_task(issue: dict, engine: str, budget_min: int, state: dict, config: dic
         env = os.environ.copy()
 
     started_at = time.time()
-    proc = subprocess.Popen(
-        cmd, env=env, stdout=open(SESSION_LOG, "a"), stderr=subprocess.STDOUT
-    )
+    popen_kwargs: dict = {"env": env, "stdout": open(SESSION_LOG, "a"), "stderr": subprocess.STDOUT}
+    if engine == "opencode":
+        popen_kwargs["cwd"] = opencode_cwd
+    proc = subprocess.Popen(cmd, **popen_kwargs)
     PID_FILE.write_text(str(proc.pid))
     proc.wait()
     PID_FILE.unlink(missing_ok=True)

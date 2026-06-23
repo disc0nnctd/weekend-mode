@@ -45,34 +45,38 @@ USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 USAGE_SNAPSHOT = WEEKEND_DIR / "usage_snapshot.json"
 ANNOUNCEMENT_LOG = WEEKEND_DIR / "last_announcement.json"
 CODEX_LB_URL = "http://127.0.0.1:2455"
-ENGINES = ("claude", "codex", "opencode", "gemini")
+ENGINES = ("claude", "claude-go", "codex", "opencode", "gemini")
 MODEL_LANES = ("default", "orchestration", "worker", "research")
 DEFAULT_MODELS = {
     "claude": "sonnet",
+    "claude-go": "default",
     "codex": "gpt-5.4",
-    "opencode": "anthropic/claude-sonnet-4-5",
+    "opencode": "opencode/deepseek-v4-flash-free",
     "gemini": "gemini-2.5-pro",
 }
 DEFAULT_LANE_MODELS = {
-    "orchestration": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-sonnet-4-5", "gemini": "gemini-2.5-pro"},
-    "worker": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-haiku-4-5", "gemini": "gemini-2.5-flash"},
-    "research": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-sonnet-4-5", "gemini": "gemini-2.5-pro"},
+    "orchestration": {"claude": "sonnet", "claude-go": "default", "codex": "gpt-5.4", "opencode": "opencode/deepseek-v4-flash-free", "gemini": "gemini-2.5-pro"},
+    "worker": {"claude": "sonnet", "claude-go": "default", "codex": "gpt-5.4", "opencode": "opencode/north-mini-code-free", "gemini": "gemini-2.5-flash"},
+    "research": {"claude": "sonnet", "claude-go": "default", "codex": "gpt-5.4", "opencode": "opencode/deepseek-v4-flash-free", "gemini": "gemini-2.5-pro"},
 }
 SMOKE_TEST_MODELS = {
     "claude": "fable",
+    "claude-go": "default",
     "codex": "gpt-5.3-codex-spark",
-    "opencode": "anthropic/claude-haiku-4-5",
+    "opencode": "opencode/north-mini-code-free",
     "gemini": "gemini-2.5-flash",
 }
 SMOKE_TEST_PROMPT = "Reply with exactly: ok"
 DEFAULT_ENGINE_TOGGLES = {
     "claude": True,
+    "claude-go": False,
     "codex": True,
     "opencode": False,
     "gemini": False,
 }
 DEFAULT_WORKER_TOGGLES = {
     "claude": True,
+    "claude-go": True,
     "codex": True,
     "opencode": True,
     "gemini": True,
@@ -182,6 +186,8 @@ def format_toggle_summary(toggle_map: dict) -> str:
 def engine_available(engine: str) -> bool:
     if engine == "claude":
         return CREDS_PATH.exists() or shutil.which("claude") is not None
+    if engine == "claude-go":
+        return shutil.which("claude-go") is not None or Path.home().joinpath("bin/claude-go").exists()
     if engine == "opencode":
         return shutil.which("opencode") is not None or Path.home().joinpath(".opencode/bin/opencode").exists()
     return shutil.which(engine) is not None
@@ -971,69 +977,205 @@ class RevokeButton(discord.ui.Button):
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-# ── Modals ─────────────────────────────────────────────────────────────────
+# ── Config UI ─────────────────────────────────────────────────────────
 
-class EditSettingModal(discord.ui.Modal, title="Edit Setting"):
-    def __init__(self, setting_key: str, current_value: str, label: str):
-        super().__init__()
-        self.setting_key = setting_key
-        self.value_input = discord.ui.TextInput(
-            label=label,
-            default=str(current_value),
-            required=True,
-            max_length=100,
-        )
-        self.add_item(self.value_input)
+def _get_nested(d: dict, key_path: str):
+    for part in key_path.split("."):
+        d = d[part]
+    return d
+
+
+def _set_nested(d: dict, key_path: str, value):
+    parts = key_path.split(".")
+    for part in parts[:-1]:
+        d = d.setdefault(part, {})
+    d[parts[-1]] = value
+
+
+def _parse_bool(raw: str) -> bool:
+    low = raw.strip().lower()
+    if low in ("true", "on", "1"):
+        return True
+    if low in ("false", "off", "0"):
+        return False
+    raise ValueError("Must be true/false/on/off/1/0")
+
+
+# 9 config sections: (title, list of (key_path, label, type))
+# type: "int", "bool", "str", "str_or_none", "list"
+CONFIG_SECTIONS = [
+    ("Claude Thresholds + Budget", [
+        ("claude_5h_threshold_pct", "Claude 5h threshold (%)", "int"),
+        ("claude_7d_threshold_pct", "Claude 7d threshold (%)", "int"),
+        ("codex_guard_pct", "Codex guard % (min remaining)", "int"),
+        ("max_task_budget_min", "Max task budget (minutes)", "int"),
+    ]),
+    ("OpenCode Guards", [
+        ("opencode_guard_pct_5h", "OpenCode guard 5h (%)", "int"),
+        ("opencode_guard_pct_month", "OpenCode guard month (%)", "int"),
+        ("opencode_guard_relax_hours", "OpenCode relax (hours)", "int"),
+        ("opencode_go_alert_pct", "OpenCode Go alert threshold (%)", "int"),
+    ]),
+    ("Engine Toggles — Orchestrators", [
+        ("start_allowed_orchestrators.claude", "Claude as orchestrator", "bool"),
+        ("start_allowed_orchestrators.codex", "Codex as orchestrator", "bool"),
+        ("start_allowed_orchestrators.opencode", "OpenCode as orchestrator", "bool"),
+        ("start_allowed_orchestrators.gemini", "Gemini as orchestrator", "bool"),
+    ]),
+    ("Engine Toggles — Workers", [
+        ("start_allowed_workers.claude", "Claude as worker", "bool"),
+        ("start_allowed_workers.codex", "Codex as worker", "bool"),
+        ("start_allowed_workers.opencode", "OpenCode as worker", "bool"),
+        ("start_allowed_workers.gemini", "Gemini as worker", "bool"),
+    ]),
+    ("Default Models", [
+        ("default_models.claude", "Claude default model", "str"),
+        ("default_models.codex", "Codex default model", "str"),
+        ("default_models.opencode", "OpenCode default model", "str"),
+        ("default_models.gemini", "Gemini default model", "str"),
+    ]),
+    ("Lane Models — Orchestration", [
+        ("lane_models.orchestration.claude", "Orchestration Claude model", "str"),
+        ("lane_models.orchestration.codex", "Orchestration Codex model", "str"),
+        ("lane_models.orchestration.opencode", "Orchestration OpenCode model", "str"),
+        ("lane_models.orchestration.gemini", "Orchestration Gemini model", "str"),
+    ]),
+    ("Lane Models — Worker", [
+        ("lane_models.worker.claude", "Worker Claude model", "str"),
+        ("lane_models.worker.codex", "Worker Codex model", "str"),
+        ("lane_models.worker.opencode", "Worker OpenCode model", "str"),
+        ("lane_models.worker.gemini", "Worker Gemini model", "str"),
+    ]),
+    ("Lane Models — Research", [
+        ("lane_models.research.claude", "Research Claude model", "str"),
+        ("lane_models.research.codex", "Research Codex model", "str"),
+        ("lane_models.research.opencode", "Research OpenCode model", "str"),
+        ("lane_models.research.gemini", "Research Gemini model", "str"),
+    ]),
+    ("Deadline + Project Queue", [
+        ("deadline_override_utc", "Deadline override (ISO UTC or blank)", "str_or_none"),
+        ("project_queue", "Project queue (comma-separated)", "list"),
+    ]),
+]
+
+
+def _extract_current(settings: dict, key_path: str, field_type: str):
+    try:
+        val = _get_nested(settings, key_path)
+    except (KeyError, TypeError):
+        return ""
+    if field_type == "bool":
+        return "true" if val else "false"
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        return ", ".join(val)
+    return str(val)
+
+
+def _label_short(label: str) -> str:
+    return label if len(label) <= 45 else label[:42] + "..."
+
+
+class SectionModal(discord.ui.Modal):
+    def __init__(self, title: str, field_defs: list, state: dict):
+        super().__init__(title=title)
+        self.field_defs = field_defs
+        settings = state["settings"]
+        for key_path, label, field_type in field_defs:
+            current = _extract_current(settings, key_path, field_type)
+            max_len = 500 if field_type == "list" else 200
+            self.add_item(discord.ui.TextInput(
+                label=_label_short(label),
+                default=current,
+                required=True,
+                max_length=max_len,
+            ))
 
     async def on_submit(self, interaction: discord.Interaction):
         state = load_state()
-        new_val = self.value_input.value.strip()
-        # Type coerce
-        old = state["settings"].get(self.setting_key)
-        try:
-            if isinstance(old, int):
-                new_val = int(new_val)
-            elif isinstance(old, float):
-                new_val = float(new_val)
-            elif isinstance(old, list):
-                new_val = [x.strip() for x in new_val.split(",")]
-        except ValueError:
-            pass
-        state["settings"][self.setting_key] = new_val
-        if self.setting_key == "codex_guard_pct":
-            normalize_codex_budget_settings(state["settings"])
-            state["settings"]["codex_default_budget"]["hourly_pct_min"] = int(new_val)
+        settings = state["settings"]
+        changes = []
+        errors = []
+
+        for i, item in enumerate(self.children):
+            key_path, label, field_type = self.field_defs[i]
+            raw = item.value.strip()
+
+            try:
+                if field_type == "int":
+                    val = int(raw)
+                elif field_type == "bool":
+                    val = _parse_bool(raw)
+                elif field_type == "str_or_none":
+                    val = raw if raw else None
+                elif field_type == "list":
+                    val = [x.strip() for x in raw.split(",") if x.strip()]
+                else:
+                    val = raw
+            except ValueError as e:
+                errors.append(f"`{label}`: {e}")
+                continue
+
+            old = _get_nested(settings, key_path)
+
+            if val == old:
+                continue
+
+            _set_nested(settings, key_path, val)
+            changes.append((label, _extract_current({"v": old}, "v", field_type), _extract_current({"v": val}, "v", field_type)))
+
+        if "codex_guard_pct" in [fd[0] for fd in self.field_defs]:
+            normalize_codex_budget_settings(settings)
+            settings["codex_default_budget"]["hourly_pct_min"] = int(settings.get("codex_guard_pct", 50))
+
+        if errors:
+            await interaction.response.send_message(
+                "**Validation errors:**\n" + "\n".join(errors), ephemeral=True
+            )
+            return
+
+        if not changes:
+            await interaction.response.send_message("No changes were made.", ephemeral=True)
+            return
+
         save_state(state)
-        await interaction.response.send_message(
-            f"Updated `{self.setting_key}` → `{new_val}`", ephemeral=True
+
+        lines = ["**Settings Updated**", ""]
+        for label, old_str, new_str in changes:
+            lines.append(f"• {label}: `{old_str}` → `{new_str}`")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+class ConfigSectionSelect(discord.ui.Select):
+    def __init__(self, state: dict):
+        self.state = state
+        options = []
+        for idx, (title, _) in enumerate(CONFIG_SECTIONS, 1):
+            options.append(discord.SelectOption(
+                label=f"{idx}. {title[:80]}",
+                value=str(idx),
+            ))
+        super().__init__(
+            placeholder="Choose a settings section to edit...",
+            min_values=1,
+            max_values=1,
+            options=options,
         )
+
+    async def callback(self, interaction: discord.Interaction):
+        idx = int(self.values[0]) - 1
+        title, field_defs = CONFIG_SECTIONS[idx]
+        self.state = load_state()
+        modal = SectionModal(title, field_defs, self.state)
+        await interaction.response.send_modal(modal)
 
 
 class ConfigView(discord.ui.View):
-    SETTINGS = [
-        ("claude_5h_threshold_pct", "Claude 5h stop threshold (%)"),
-        ("claude_7d_threshold_pct", "Claude 7d stop threshold (%)"),
-        ("codex_guard_pct", "Codex guard % (min remaining)"),
-        ("max_task_budget_min", "Max task budget (minutes)"),
-        ("deadline_override_utc", "Deadline override (ISO UTC or blank)"),
-        ("project_queue", "Project queue (comma-separated)"),
-    ]
-
     def __init__(self, state: dict):
         super().__init__(timeout=300)
-        for key, label in self.SETTINGS:
-            btn = discord.ui.Button(label=f"Edit: {label[:35]}", style=discord.ButtonStyle.secondary)
-            btn.callback = self._make_callback(key, label, state)
-            self.add_item(btn)
-
-    def _make_callback(self, key: str, label: str, state: dict):
-        async def callback(interaction: discord.Interaction):
-            current = state["settings"].get(key, "")
-            if isinstance(current, list):
-                current = ", ".join(current)
-            modal = EditSettingModal(key, current, label[:45])
-            await interaction.response.send_modal(modal)
-        return callback
+        self.add_item(ConfigSectionSelect(state))
 
 
 # ── Slash Commands ─────────────────────────────────────────────────────────

@@ -33,26 +33,29 @@ PID_FILE = WEEKEND_DIR / "session.pid"
 CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 CODEX_LB_URL = "http://127.0.0.1:2455/api/accounts"
-ENGINES = ("claude", "codex", "opencode", "gemini")
+ENGINES = ("claude", "claude-go", "codex", "opencode", "gemini")
 DEFAULT_MODELS = {
     "claude": "sonnet",
+    "claude-go": "default",
     "codex": "gpt-5.4",
-    "opencode": "anthropic/claude-sonnet-4-5",
+    "opencode": "opencode/deepseek-v4-flash-free",
     "gemini": "gemini-2.5-pro",
 }
 DEFAULT_LANE_MODELS = {
-    "orchestration": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-sonnet-4-5", "gemini": "gemini-2.5-pro"},
-    "worker": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-haiku-4-5", "gemini": "gemini-2.5-flash"},
-    "research": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-sonnet-4-5", "gemini": "gemini-2.5-pro"},
+    "orchestration": {"claude": "sonnet", "claude-go": "default", "codex": "gpt-5.4", "opencode": "opencode/deepseek-v4-flash-free", "gemini": "gemini-2.5-pro"},
+    "worker": {"claude": "sonnet", "claude-go": "default", "codex": "gpt-5.4", "opencode": "opencode/north-mini-code-free", "gemini": "gemini-2.5-flash"},
+    "research": {"claude": "sonnet", "claude-go": "default", "codex": "gpt-5.4", "opencode": "opencode/deepseek-v4-flash-free", "gemini": "gemini-2.5-pro"},
 }
 DEFAULT_ENGINE_TOGGLES = {
     "claude": True,
+    "claude-go": False,
     "codex": True,
     "opencode": False,
     "gemini": False,
 }
 DEFAULT_WORKER_TOGGLES = {
     "claude": True,
+    "claude-go": True,
     "codex": True,
     "opencode": True,
     "gemini": True,
@@ -301,6 +304,9 @@ def pick_engine(
     if "claude" in allowed and usage is not None and usage["5h_pct"] < threshold_5h:
         return "claude"
 
+    if "claude-go" in allowed and shutil.which("claude-go") is not None:
+        return "claude-go"
+
     if "codex" in allowed and codex_health is not None:
         return "codex"
 
@@ -538,11 +544,11 @@ def run_task(issue: dict, engine: str, budget_min: int, state: dict, config: dic
 
     SKIP_FLAG.unlink(missing_ok=True)
 
-    if engine == "claude":
-        cmd = [
-            "timeout", str(budget_min * 60),
-            "claude", "--dangerously-skip-permissions", "--model", model, "-p", prompt
-        ]
+    if engine in ("claude", "claude-go"):
+        binary = "claude-go" if engine == "claude-go" else "claude"
+        cmd = ["timeout", str(budget_min * 60), binary, "--dangerously-skip-permissions", "-p", prompt]
+        if engine == "claude":
+            cmd = ["timeout", str(budget_min * 60), "claude", "--dangerously-skip-permissions", "--model", model, "-p", prompt]
         env = os.environ.copy()
     elif engine == "codex":
         cmd = [

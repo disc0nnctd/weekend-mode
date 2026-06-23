@@ -27,6 +27,9 @@ from pathlib import Path
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from codex_budgeting import account_key, evaluate_account_budget, normalize_codex_budget_settings
+from opencode_usage import summarize_opencode_usage
+from reset_detection import detect_resets
 
 # ── paths ──────────────────────────────────────────────────────────────────
 
@@ -42,38 +45,57 @@ USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 USAGE_SNAPSHOT = WEEKEND_DIR / "usage_snapshot.json"
 ANNOUNCEMENT_LOG = WEEKEND_DIR / "last_announcement.json"
 CODEX_LB_URL = "http://127.0.0.1:2455"
-ENGINES = ("claude", "codex", "gemini")
+ENGINES = ("claude", "codex", "opencode", "gemini")
 MODEL_LANES = ("default", "orchestration", "worker", "research")
 DEFAULT_MODELS = {
     "claude": "sonnet",
     "codex": "gpt-5.4",
+    "opencode": "anthropic/claude-sonnet-4-5",
     "gemini": "gemini-2.5-pro",
 }
 DEFAULT_LANE_MODELS = {
-    "orchestration": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-pro"},
-    "worker": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-flash"},
-    "research": {"claude": "sonnet", "codex": "gpt-5.4", "gemini": "gemini-2.5-pro"},
+    "orchestration": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-sonnet-4-5", "gemini": "gemini-2.5-pro"},
+    "worker": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-haiku-4-5", "gemini": "gemini-2.5-flash"},
+    "research": {"claude": "sonnet", "codex": "gpt-5.4", "opencode": "anthropic/claude-sonnet-4-5", "gemini": "gemini-2.5-pro"},
 }
 SMOKE_TEST_MODELS = {
     "claude": "fable",
     "codex": "gpt-5.3-codex-spark",
+    "opencode": "anthropic/claude-haiku-4-5",
     "gemini": "gemini-2.5-flash",
 }
 SMOKE_TEST_PROMPT = "Reply with exactly: ok"
 DEFAULT_ENGINE_TOGGLES = {
     "claude": True,
     "codex": True,
+    "opencode": False,
     "gemini": False,
 }
 DEFAULT_WORKER_TOGGLES = {
     "claude": True,
     "codex": True,
+    "opencode": True,
     "gemini": True,
 }
 DEFAULT_SETTINGS = {
     "claude_5h_threshold_pct": 90,
     "claude_7d_threshold_pct": 95,
     "codex_guard_pct": 50,
+    "codex_default_budget": {
+        "hourly_pct_min": 50,
+        "weekly_pct_min": 0,
+        "monthly_credits_min": 0,
+    },
+    "codex_account_budgets": {},
+    "opencode_go_alert_pct": 100,
+    "opencode_guard_pct_5h": 50,
+    "opencode_guard_pct_month": 50,
+    "system_temp_warn_c": {
+        "cpu_package": 85,
+        "nvme": 70,
+        "wifi": 75,
+    },
+    "system_temp_cooldown_min": 30,
     "max_task_budget_min": 120,
     "deadline_override_utc": None,
     "project_queue": [
@@ -116,6 +138,8 @@ def _deep_fill_missing(target: dict, defaults: dict) -> bool:
 def normalize_state(state: dict) -> dict:
     state.setdefault("settings", {})
     _deep_fill_missing(state["settings"], DEFAULT_SETTINGS)
+    normalize_codex_budget_settings(state["settings"])
+    state["settings"]["codex_default_budget"]["hourly_pct_min"] = state["settings"].get("codex_guard_pct", 50)
     for lane_name, models in DEFAULT_LANE_MODELS.items():
         lane_models = state["settings"]["lane_models"].setdefault(lane_name, {})
         _deep_fill_missing(lane_models, models)
@@ -157,6 +181,8 @@ def format_toggle_summary(toggle_map: dict) -> str:
 def engine_available(engine: str) -> bool:
     if engine == "claude":
         return CREDS_PATH.exists() or shutil.which("claude") is not None
+    if engine == "opencode":
+        return shutil.which("opencode") is not None or Path.home().joinpath(".opencode/bin/opencode").exists()
     return shutil.which(engine) is not None
 
 
@@ -238,6 +264,185 @@ def render_model_settings(state: dict) -> list[str]:
 def usage_bar(pct: float, width: int = 10) -> str:
     filled = int(round(pct / 100 * width))
     return "█" * filled + "░" * (width - filled)
+
+
+def render_opencode_compact(summary: dict | None) -> list[str]:
+    if not summary:
+        return ["_(opencode usage unavailable)_"]
+    lines = ["**OpenCode Go Usage**"]
+    labels = {
+        "5h": "5h",
+        "7d": "7d",
+        "month": "month",
+    }
+    for window_name in ("5h", "7d", "month"):
+        window = summary["windows"][window_name]
+        lines.append(
+            f"{labels[window_name]:<5} {usage_bar(min(float(window['pct_used']), 100.0))}  "
+            f"${window['cost_usd']:.2f}/${window['limit_usd']:.2f}  "
+            f"{window['pct_used']:.0f}%  resets {fmt_reset(window['reset_at'])}"
+        )
+    top_models = summary.get("models", [])[:3]
+    if top_models:
+        lines.append("Top models: " + ", ".join(f"{item['model_id']} (${item['cost_usd']:.2f})" for item in top_models))
+    return lines
+
+
+def render_opencode_detailed(summary: dict | None) -> list[str]:
+    if not summary:
+        return ["OpenCode usage unavailable. No `opencode.db` data found."]
+    lines = render_opencode_compact(summary)
+    lines.append(f"DB: `{summary['db_path']}`")
+    lines.append(f"Sessions tracked: {summary['session_count']}")
+    lines.append(f"Last session: {fmt_reset(summary['last_session_at'])}")
+    if summary.get("models"):
+        lines.append("")
+        lines.append("**Model breakdown**")
+        for item in summary["models"][:8]:
+            lines.append(
+                f"`{item['model_id']}` — {item['sessions']} session(s), "
+                f"${item['cost_usd']:.2f}, in={item['tokens_input']}, out={item['tokens_output']}"
+            )
+    return lines
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        return Path(path).read_text().strip()
+    except Exception:
+        return None
+
+
+def _fmt_bytes(num: float) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}TB"
+
+
+def _safe_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def get_system_stats() -> dict:
+    stats: dict[str, object] = {"temps": {}, "warnings": []}
+
+    try:
+        uptime_s = float(_read_text("/proc/uptime").split()[0])
+        h = int(uptime_s // 3600)
+        m = int((uptime_s % 3600) // 60)
+        stats["uptime"] = f"{h}h {m}m"
+    except Exception:
+        stats["uptime"] = "unknown"
+
+    try:
+        load1, load5, load15 = os.getloadavg()
+        stats["load"] = f"{load1:.2f} {load5:.2f} {load15:.2f}"
+    except Exception:
+        stats["load"] = "unknown"
+
+    try:
+        meminfo = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, value = line.split(":", 1)
+            meminfo[key] = int(value.strip().split()[0]) * 1024
+        total = meminfo.get("MemTotal", 0)
+        available = meminfo.get("MemAvailable", 0)
+        used = max(0, total - available)
+        used_pct = (used / total * 100) if total else 0
+        stats["memory"] = f"{_fmt_bytes(used)}/{_fmt_bytes(total)} ({used_pct:.0f}%)"
+    except Exception:
+        stats["memory"] = "unknown"
+
+    try:
+        disk = shutil.disk_usage(str(Path.home()))
+        used_pct = (disk.used / disk.total * 100) if disk.total else 0
+        stats["disk"] = f"{_fmt_bytes(disk.used)}/{_fmt_bytes(disk.total)} ({used_pct:.0f}%)"
+    except Exception:
+        stats["disk"] = "unknown"
+
+    sensors_output = ""
+    try:
+        result = subprocess.run(["sensors"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            sensors_output = result.stdout
+    except Exception:
+        pass
+
+    cpu_package = None
+    nvme = None
+    wifi = None
+    for line in sensors_output.splitlines():
+        if "Package id 0:" in line and cpu_package is None:
+            match = re.search(r"([+-]?\d+(?:\.\d+)?)°C", line)
+            if match:
+                cpu_package = float(match.group(1))
+        elif "Composite:" in line and nvme is None:
+            match = re.search(r"([+-]?\d+(?:\.\d+)?)°C", line)
+            if match:
+                nvme = float(match.group(1))
+        elif "iwlwifi" in sensors_output and "temp1:" in line and wifi is None:
+            match = re.search(r"([+-]?\d+(?:\.\d+)?)°C", line)
+            if match:
+                wifi = float(match.group(1))
+
+    temps = stats["temps"]
+    if cpu_package is not None:
+        temps["cpu_package"] = cpu_package
+    if nvme is not None:
+        temps["nvme"] = nvme
+    if wifi is not None:
+        temps["wifi"] = wifi
+
+    return stats
+
+
+def render_system_stats(stats: dict) -> list[str]:
+    temps = stats.get("temps", {})
+    temp_bits = []
+    for key in ("cpu_package", "nvme", "wifi"):
+        value = temps.get(key)
+        if value is not None:
+            temp_bits.append(f"{key}={value:.1f}C")
+    return [
+        "**System**",
+        f"Uptime: {stats.get('uptime', 'unknown')}",
+        f"Load: {stats.get('load', 'unknown')}",
+        f"Memory: {stats.get('memory', 'unknown')}",
+        f"Disk: {stats.get('disk', 'unknown')}",
+        "Temps: " + (", ".join(temp_bits) if temp_bits else "unavailable"),
+    ]
+
+
+def detect_temp_warnings(state: dict, stats: dict) -> list[dict]:
+    settings = state["settings"]
+    thresholds = settings.get("system_temp_warn_c", {})
+    temps = stats.get("temps", {})
+    alerts = []
+    for key, threshold in thresholds.items():
+        value = temps.get(key)
+        if value is None:
+            continue
+        if float(value) >= float(threshold):
+            alerts.append({"sensor": key, "value": float(value), "threshold": float(threshold)})
+    return alerts
 
 
 def fmt_reset(iso: str, window_hours: int = 0) -> str:
@@ -389,6 +594,38 @@ def fmt_codex_account(a: dict) -> str:
     return "  ".join(parts)
 
 
+def render_codex_budget_settings(state: dict, accounts: list[dict] | None = None) -> list[str]:
+    settings = state["settings"]
+    normalize_codex_budget_settings(settings)
+    default_budget = settings["codex_default_budget"]
+    lines = [
+        "**Codex Budgets**",
+        f"Default hourly minimum remaining: **{default_budget['hourly_pct_min']}%**",
+        f"Default weekly minimum remaining: **{default_budget['weekly_pct_min']}%**",
+        f"Default monthly minimum credits: **{default_budget['monthly_credits_min']}**",
+    ]
+    account_budgets = settings.get("codex_account_budgets", {})
+    if account_budgets:
+        lines.append("")
+        lines.append("**Per-account overrides**")
+        for key in sorted(account_budgets):
+            budget = account_budgets[key]
+            lines.append(
+                f"`{key}` → hourly>={budget.get('hourly_pct_min', default_budget['hourly_pct_min'])}% "
+                f"weekly>={budget.get('weekly_pct_min', default_budget['weekly_pct_min'])}% "
+                f"monthly>={budget.get('monthly_credits_min', default_budget['monthly_credits_min'])}"
+            )
+    if accounts:
+        lines.append("")
+        lines.append("**Live account evaluation**")
+        for account in accounts:
+            evaluation = evaluate_account_budget(settings, account)
+            verdict = "PASS" if evaluation["ok"] else "BLOCK"
+            suffix = "" if evaluation["ok"] else " — " + "; ".join(evaluation["reasons"])
+            lines.append(f"`{evaluation['key']}` {verdict}{suffix}")
+    return lines
+
+
 # ── Usage snapshot (for reset detection) ──────────────────────────────────
 
 def load_snapshot() -> dict:
@@ -404,90 +641,39 @@ def save_snapshot(snap: dict):
     USAGE_SNAPSHOT.write_text(json.dumps(snap, indent=2))
 
 
-def detect_resets(old: dict, new_usage: dict | None, new_codex: list) -> list[str]:
-    """Compare snapshots and return list of reset event descriptions."""
-    events = []
-    if new_usage:
-        # Claude 5h reset: resets_at timestamp changed → new window
-        if old.get("claude_5h_resets_at") and old["claude_5h_resets_at"] != new_usage["5h_resets_at"]:
-            events.append(f"🔄 **Claude 5h window reset** — now at {new_usage['5h_pct']:.0f}% used")
-        # Claude 7d reset: resets_at changed
-        if old.get("claude_7d_resets_at") and old["claude_7d_resets_at"] != new_usage["7d_resets_at"]:
-            events.append(f"🗓️ **Claude weekly (7d) reset** — now at {new_usage['7d_pct']:.0f}% used")
-
-    # Codex resets
-    old_codex = {a["email"]: a for a in old.get("codex_accounts", []) if a.get("email")}
-    for acc in new_codex:
-        email = acc.get("email", "")
-        usage = acc.get("usage") or {}
-        old_acc = old_codex.get(email)
-        if not old_acc:
-            continue
-        old_usage = old_acc.get("usage") or {}
-        # Secondary window reset: resetAtSecondary changed
-        new_reset = acc.get("resetAtSecondary", "")
-        old_reset = old_acc.get("resetAtSecondary", "")
-        if old_reset and new_reset and old_reset != new_reset:
-            sec_rem = usage.get("secondaryRemainingPercent", 0)
-            events.append(f"⏱️ **Codex window reset** `{email}` — {sec_rem:.0f}% remaining")
-        # Monthly credits reset: remainingCredits jumped up by >20%
-        new_cred = acc.get("remainingCreditsSecondary")
-        old_cred = old_acc.get("remainingCreditsSecondary")
-        if new_cred and old_cred and new_cred > old_cred * 1.2:
-            cap = acc.get("capacityCreditsSecondary", 0)
-            events.append(f"📅 **Codex monthly credits reset** `{email}` — {new_cred:.0f}/{cap:.0f} credits")
-    return events
-
-
 # ── Work suggestions ───────────────────────────────────────────────────────
 
-def suggest_weekend_work() -> str:
-    """Query beads for top open issues and format as a weekend suggestion."""
+def get_ready_beads_tasks(limit: int = 5) -> list[dict]:
     try:
-        result = subprocess.run(["bd", "list", "--status=open"],
-                                capture_output=True, text=True, timeout=15)
-        state = load_state()
-        queue = state["settings"].get("project_queue", [])
-        project_dirs = state.get("project_dirs", {})
+        result = subprocess.run(
+            ["bd", "-C", "/home/notdc", "ready", "--json", "--limit", str(limit)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        payload = json.loads(result.stdout)
+        return payload if isinstance(payload, list) else []
+    except Exception:
+        return []
 
-        # Build project → issues mapping; prefer P1 then P2
-        project_issues: dict[str, list[str]] = {p: [] for p in queue}
-        other: list[str] = []
 
-        for line in result.stdout.splitlines():
-            if not line.strip() or "[weekend-approved]" in line.lower():
-                continue
-            match = re.search(r'\b(home-\w+)\b', line)
-            if not match:
-                continue
-            issue_id = match.group(1)
-            title = re.sub(r'.*P\d\s+', '', line).strip()[:70]
-            placed = False
-            for p, d in project_dirs.items():
-                # Heuristic: issue belongs to project if its title/notes hint at it
-                # For now, just bucket by priority order (first 3 per project)
-                if p in queue and len(project_issues[p]) < 3:
-                    project_issues[p].append(f"`{issue_id}` {title}")
-                    placed = True
-                    break
-            if not placed and len(other) < 3:
-                other.append(f"`{issue_id}` {title}")
-
-        lines = ["**📋 Suggested issues for this weekend:**"]
+def suggest_weekend_work() -> str:
+    """Query beads for ready issues and format as a weekend suggestion."""
+    try:
+        tasks = get_ready_beads_tasks(limit=8)
+        if not tasks:
+            return "_(no ready Beads work found)_"
+        lines = ["**📋 Ready Beads work:**"]
         all_ids = []
-        for project in queue:
-            issues = project_issues.get(project, [])
-            if issues:
-                lines.append(f"\n**{project}**")
-                for issue in issues:
-                    lines.append(f"  • {issue}")
-                    all_ids.append(issue.split()[0].strip('`'))
-        if other:
-            lines.append("\n**other**")
-            for issue in other:
-                lines.append(f"  • {issue}")
-                all_ids.append(issue.split()[0].strip('`'))
-
+        for item in tasks:
+            issue_id = item.get("id", "unknown")
+            title = (item.get("title") or "").strip()
+            issue_type = item.get("issue_type") or "task"
+            priority = item.get("priority")
+            lines.append(f"  • `{issue_id}` P{priority} [{issue_type}] {title[:80]}")
+            all_ids.append(issue_id)
         if all_ids:
             lines.append(f"\n`/weekend-approve {' '.join(all_ids[:8])}`")
         return "\n".join(lines)
@@ -514,6 +700,12 @@ def build_announcement(trigger: str, usage: dict | None, codex_accounts: list) -
         for acc in codex_accounts[:4]:
             if (acc.get("status") or "").lower() not in ("quota_exceeded", "deactivated"):
                 parts.append(fmt_codex_account(acc))
+
+    parts.append("")
+    parts.extend(render_opencode_compact(summarize_opencode_usage()))
+
+    parts.append("")
+    parts.extend(render_system_stats(get_system_stats()))
 
     parts.append("")
     parts.append(suggest_weekend_work())
@@ -807,6 +999,9 @@ class EditSettingModal(discord.ui.Modal, title="Edit Setting"):
         except ValueError:
             pass
         state["settings"][self.setting_key] = new_val
+        if self.setting_key == "codex_guard_pct":
+            normalize_codex_budget_settings(state["settings"])
+            state["settings"]["codex_default_budget"]["hourly_pct_min"] = int(new_val)
         save_state(state)
         await interaction.response.send_message(
             f"Updated `{self.setting_key}` → `{new_val}`", ephemeral=True
@@ -882,6 +1077,7 @@ async def weekend_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     state = load_state()
     usage = get_claude_usage()
+    opencode_summary = summarize_opencode_usage()
     active = state.get("active", False)
     last = state.get("last_issue_worked") or "none"
     done = len(state.get("tasks_completed", []))
@@ -911,6 +1107,24 @@ async def weekend_status(interaction: discord.Interaction):
 
     approved = get_approved_issues()
     lines.append(f"Approved queue: {len(approved)} issues")
+    ready_tasks = get_ready_beads_tasks(limit=5)
+    if ready_tasks:
+        lines.append(f"Ready Beads tasks: {len(ready_tasks)} shown below")
+        for item in ready_tasks:
+            lines.append(f"• `{item.get('id', 'unknown')}` P{item.get('priority', '?')} {item.get('title', '')[:72]}")
+    else:
+        lines.append("Ready Beads tasks: 0")
+    lines.extend([""] + render_system_stats(get_system_stats()))
+    lines.extend([""] + render_opencode_compact(opencode_summary))
+    codex_accounts = get_codex_accounts()
+    if codex_accounts:
+        lines.extend(["", "**Codex budgets**"])
+        for account in codex_accounts[:5]:
+            evaluation = evaluate_account_budget(state["settings"], account)
+            lines.append(
+                f"{evaluation['key']}: {'PASS' if evaluation['ok'] else 'BLOCK'}"
+                + ("" if evaluation["ok"] else f" ({'; '.join(evaluation['reasons'])})")
+            )
     if state.get("last_provider_check_utc"):
         lines.append(f"Last provider check: {state['last_provider_check_utc']}")
         checks = state.get("last_provider_checks", {})
@@ -922,6 +1136,28 @@ async def weekend_status(interaction: discord.Interaction):
                 )
 
     await interaction.followup.send("\n".join(lines), view=WeekendStatusView(), ephemeral=True)
+
+
+@tree.command(name="weekend-opencode-usage", description="Show OpenCode Go usage from the local OpenCode database")
+async def weekend_opencode_usage(interaction: discord.Interaction):
+    summary = summarize_opencode_usage()
+    await interaction.response.send_message("\n".join(render_opencode_detailed(summary)), ephemeral=True)
+
+
+@tree.command(name="system-status", description="Show current temperatures and system stats")
+async def system_status(interaction: discord.Interaction):
+    stats = get_system_stats()
+    state = load_state()
+    lines = render_system_stats(stats)
+    warnings = detect_temp_warnings(state, stats)
+    if warnings:
+        lines.append("")
+        lines.append("**Warnings**")
+        for item in warnings:
+            lines.append(
+                f"{item['sensor']}: {item['value']:.1f}C >= {item['threshold']:.1f}C"
+            )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @tree.command(name="weekend-queue", description="Show and manage the approved issue queue")
@@ -992,15 +1228,22 @@ async def weekend_config(interaction: discord.Interaction):
     state = load_state()
     s = state["settings"]
     queue_str = ", ".join(s.get("project_queue", []))
+    temp_warn = s.get("system_temp_warn_c", {})
     lines = [
         "**Weekend Mode Settings** (click to edit)",
         f"Claude 5h threshold: **{s['claude_5h_threshold_pct']}%**",
         f"Claude 7d threshold: **{s['claude_7d_threshold_pct']}%**",
         f"Codex guard: **{s['codex_guard_pct']}%** minimum remaining",
+        f"Codex default budget: **hourly>={s['codex_default_budget']['hourly_pct_min']}% weekly>={s['codex_default_budget']['weekly_pct_min']}% monthly>={s['codex_default_budget']['monthly_credits_min']}**",
+        f"OpenCode Go alert threshold: **{s.get('opencode_go_alert_pct', 100)}%** of official window limits",
+        f"Temp warn: **cpu>={temp_warn.get('cpu_package', 'n/a')}C nvme>={temp_warn.get('nvme', 'n/a')}C wifi>={temp_warn.get('wifi', 'n/a')}C**",
+        f"Temp cooldown: **{s.get('system_temp_cooldown_min', 30)} min**",
         f"Max task budget: **{s['max_task_budget_min']} min**",
         f"Deadline override: **{s.get('deadline_override_utc') or 'auto (Mon 07:30 IST)'}**",
         f"Project queue: **{queue_str}**",
         "Use `/weekend-models` and `/weekend-model-set` for model lanes.",
+        "Use `/weekend-codex-budgets` and `/weekend-codex-budget-set` for per-account Codex policy.",
+        "Use `/system-temp-config` for temperature warning thresholds.",
     ]
     await interaction.response.send_message(
         "\n".join(lines), view=ConfigView(state), ephemeral=True
@@ -1049,6 +1292,84 @@ async def weekend_model_set(interaction: discord.Interaction, lane: str, engine:
     save_state(state)
     await interaction.response.send_message(
         f"Updated `{lane}` `{engine}` → `{resolve_lane_model(state, lane, engine)}`",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="weekend-codex-budgets", description="Show Codex default and per-account budget policy")
+async def weekend_codex_budgets(interaction: discord.Interaction):
+    state = load_state()
+    accounts = get_codex_accounts()
+    await interaction.response.send_message(
+        "\n".join(render_codex_budget_settings(state, accounts)),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="weekend-codex-budget-set", description="Set Codex budget limits for default policy or one account")
+@app_commands.describe(
+    account="Account email/display name, or 'default' for the global policy",
+    hourly_pct_min="Minimum secondary-window remaining percent",
+    weekly_pct_min="Minimum primary-window remaining percent",
+    monthly_credits_min="Minimum remaining monthly credits",
+)
+async def weekend_codex_budget_set(
+    interaction: discord.Interaction,
+    account: str,
+    hourly_pct_min: app_commands.Range[int, 0, 100],
+    weekly_pct_min: app_commands.Range[int, 0, 100],
+    monthly_credits_min: app_commands.Range[int, 0, 100000],
+):
+    state = load_state()
+    settings = state["settings"]
+    normalize_codex_budget_settings(settings)
+    payload = {
+        "hourly_pct_min": int(hourly_pct_min),
+        "weekly_pct_min": int(weekly_pct_min),
+        "monthly_credits_min": int(monthly_credits_min),
+    }
+    key = account.strip()
+    if key.lower() == "default":
+        settings["codex_default_budget"] = payload
+        settings["codex_guard_pct"] = payload["hourly_pct_min"]
+        save_state(state)
+        await interaction.response.send_message(
+            f"Updated default Codex budget → hourly>={payload['hourly_pct_min']}% weekly>={payload['weekly_pct_min']}% monthly>={payload['monthly_credits_min']}",
+            ephemeral=True,
+        )
+        return
+    settings["codex_account_budgets"][key] = payload
+    save_state(state)
+    await interaction.response.send_message(
+        f"Updated Codex budget for `{key}` → hourly>={payload['hourly_pct_min']}% weekly>={payload['weekly_pct_min']}% monthly>={payload['monthly_credits_min']}",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="system-temp-config", description="Set temperature warning thresholds and cooldown")
+@app_commands.describe(
+    cpu_package_c="Warn when CPU package reaches this temperature",
+    nvme_c="Warn when NVMe reaches this temperature",
+    wifi_c="Warn when WiFi sensor reaches this temperature",
+    cooldown_min="Minimum minutes between repeated warnings per sensor",
+)
+async def system_temp_config(
+    interaction: discord.Interaction,
+    cpu_package_c: app_commands.Range[int, 40, 120],
+    nvme_c: app_commands.Range[int, 30, 120],
+    wifi_c: app_commands.Range[int, 30, 120],
+    cooldown_min: app_commands.Range[int, 1, 360],
+):
+    state = load_state()
+    state["settings"]["system_temp_warn_c"] = {
+        "cpu_package": int(cpu_package_c),
+        "nvme": int(nvme_c),
+        "wifi": int(wifi_c),
+    }
+    state["settings"]["system_temp_cooldown_min"] = int(cooldown_min)
+    save_state(state)
+    await interaction.response.send_message(
+        f"Updated temp warnings → cpu>={cpu_package_c}C nvme>={nvme_c}C wifi>={wifi_c}C, cooldown={cooldown_min} min",
         ephemeral=True,
     )
 
@@ -1173,6 +1494,43 @@ async def scheduled_announcements():
     # Split if too long for one message
     for chunk in [content[i:i+1900] for i in range(0, len(content), 1900)]:
         await channel.send(chunk)
+
+
+@tasks.loop(minutes=5)
+async def temp_monitor():
+    state = load_state()
+    channel = await get_announcement_channel()
+    if not channel:
+        return
+    stats = get_system_stats()
+    warnings = detect_temp_warnings(state, stats)
+    if not warnings:
+        return
+
+    cooldown_min = int(state["settings"].get("system_temp_cooldown_min", 30))
+    now = datetime.now(timezone.utc)
+    last_sent = state.setdefault("last_temp_warning_utc", {})
+    pending = []
+    for item in warnings:
+        key = item["sensor"]
+        previous = _parse_iso_dt(last_sent.get(key))
+        if previous is not None and (now - previous).total_seconds() < cooldown_min * 60:
+            continue
+        pending.append(item)
+
+    if not pending:
+        return
+
+    lines = ["**🌡️ System Temperature Warning**", ""]
+    for item in pending:
+        lines.append(
+            f"{item['sensor']}: {item['value']:.1f}C >= {item['threshold']:.1f}C"
+        )
+        last_sent[item["sensor"]] = now.isoformat()
+    lines.append("")
+    lines.extend(render_system_stats(stats))
+    save_state(state)
+    await channel.send("\n".join(lines))
 
 
 def _next_reset_sleep(usage: dict | None, codex_accounts: list) -> float:
@@ -1304,9 +1662,21 @@ async def on_ready():
             synced = await tree.sync()
             logger.warning(f"Synced {len(synced)} commands globally")
         logger.warning(f"Bot ready as {bot.user}")
-        scheduled_announcements.start()
-        asyncio.create_task(smart_reset_monitor())
-        logger.warning("Started background tasks: scheduled_announcements, smart_reset_monitor")
+        started = []
+        if not scheduled_announcements.is_running():
+            scheduled_announcements.start()
+            started.append("scheduled_announcements")
+        if not temp_monitor.is_running():
+            temp_monitor.start()
+            started.append("temp_monitor")
+        reset_task = getattr(bot, "_weekend_reset_monitor_task", None)
+        if reset_task is None or reset_task.done():
+            bot._weekend_reset_monitor_task = asyncio.create_task(smart_reset_monitor())
+            started.append("smart_reset_monitor")
+        if started:
+            logger.warning(f"Started background tasks: {', '.join(started)}")
+        else:
+            logger.warning("Background tasks already running")
     except Exception as e:
         logger.error(f"on_ready failed: {e}", exc_info=True)
 

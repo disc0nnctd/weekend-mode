@@ -48,7 +48,7 @@ DEFAULT_LANE_MODELS = {
 }
 DEFAULT_ENGINE_TOGGLES = {
     "claude": True,
-    "claude-go": False,
+    "claude-go": True,
     "codex": True,
     "opencode": False,
     "gemini": False,

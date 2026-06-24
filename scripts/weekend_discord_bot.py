@@ -69,7 +69,7 @@ SMOKE_TEST_MODELS = {
 SMOKE_TEST_PROMPT = "Reply with exactly: ok"
 DEFAULT_ENGINE_TOGGLES = {
     "claude": True,
-    "claude-go": False,
+    "claude-go": True,
     "codex": True,
     "opencode": False,
     "gemini": False,

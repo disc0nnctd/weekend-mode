@@ -1,6 +1,7 @@
 {
   "_note": "Copy to ~/.weekend-mode/config.json and fill in real values",
   "DISCORD_BOT_TOKEN": "YOUR_DISCORD_BOT_TOKEN",
+  "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/...",
   "DISCORD_GUILD_ID": "YOUR_GUILD_ID",
   "CODEX_LB_KEY": "codex-lb-local",
   "CODEX_LB_API_KEY": "sk-clb-YOUR_KEY_HERE",

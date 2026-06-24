@@ -4,7 +4,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /home/notdc/scripts/weekend_scheduler.py
+ExecStart=/usr/bin/python3 /home/notdc/projects/weekend-mode/scripts/weekend_scheduler.py
 WorkingDirectory=/home/notdc
 Environment=HOME=/home/notdc
 Environment=PATH=/home/notdc/.local/bin:/usr/local/bin:/usr/bin:/bin

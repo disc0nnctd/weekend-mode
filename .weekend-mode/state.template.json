@@ -5,6 +5,18 @@
     "claude_5h_threshold_pct": 90,
     "claude_7d_threshold_pct": 95,
     "codex_guard_pct": 50,
+    "codex_default_budget": {
+      "hourly_pct_min": 50,
+      "weekly_pct_min": 0,
+      "monthly_credits_min": 0
+    },
+    "codex_account_budgets": {},
+    "system_temp_warn_c": {
+      "cpu_package": 85,
+      "nvme": 70,
+      "wifi": 75
+    },
+    "system_temp_cooldown_min": 30,
     "max_task_budget_min": 120,
     "deadline_override_utc": null,
     "default_models": {
@@ -57,6 +69,7 @@
   "last_session_end_utc": null,
   "last_provider_check_utc": null,
   "last_provider_checks": {},
+  "last_temp_warning_utc": {},
   "session_allowed_orchestrators": {
     "claude": true,
     "codex": true,
